@@ -5,13 +5,13 @@ use futures_util::{StreamExt, TryFutureExt};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HOST, REFERER, USER_AGENT};
 use std::error::Error;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Cursor, Write};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
 use shellexpand;
 use std::process::{Command, Stdio};
-use std::thread;
+use std::{env, thread};
 use tokio::fs;
 
 use reqwest::{Client, blocking as blocking_reqwest};
@@ -22,6 +22,8 @@ use tokio::runtime::Runtime;
 use url::Url;
 
 use anyhow::Result;
+use reqwest::blocking::get;
+use zip::ZipArchive;
 
 fn extract_output_path(arg_line: &str) -> Option<PathBuf> {
     let parts = shell_words::split(arg_line).ok()?;
@@ -39,6 +41,42 @@ fn extract_output_path(arg_line: &str) -> Option<PathBuf> {
         i += 1;
     }
     None
+}
+
+async fn download_curl() -> Result<(), Box<dyn std::error::Error>> {
+    let out_path = Path::new("curl.exe");
+    if out_path.exists() {
+        println!("curl.exe already exists, skipping download.");
+        return Ok(());
+    }
+
+    let url = "https://curl.se/windows/latest.cgi?p=win64-mingw.zip";
+    println!("Downloading {}", url);
+
+    let resp = reqwest::Client::new().get(url).send().await?;
+    if !resp.status().is_success() {
+        return Err(format!("Download failed: HTTP {}", resp.status()).into());
+    }
+
+    let bytes = resp.bytes().await?; // bytes::Bytes
+    let reader = Cursor::new(bytes);
+
+    let mut zip = ZipArchive::new(reader)?;
+
+    let target = "curl-8.17.0_5-win64-mingw/bin/curl.exe";
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let name = entry.name().replace('\\', "/");
+        if name == target {
+            let mut content: Vec<u8> = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content)?;
+            fs::write(out_path, &content).await?;
+            println!("Extracted curl.exe");
+            return Ok(());
+        }
+    }
+
+    Err(format!("{} not found in archive", target).into())
 }
 
 async fn download_ytdlp(
@@ -220,6 +258,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         eprintln!("Downloading failed: {}", e);
     }
+
+    // if let Err(e) = download_curl().await {
+    //     eprintln!("Downloading failed: {}", e);
+    // }
 
     loop {
         let mut raw_input = String::new();
