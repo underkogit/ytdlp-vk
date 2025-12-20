@@ -250,6 +250,11 @@ async fn download_sound(first: &str, second: &str) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    println!("{}" , "By UnderKo");
+    println!("{}" , "https://github.com/underkogit/ytdlp-vk");
+    println!("{}" , "Using: ytdlp and curl");
+
     if let Err(e) = download_ytdlp(
         "yt-dlp.exe",
         "https://api.github.com/repos/yt-dlp/yt-dlp/releases",
