@@ -1,5 +1,7 @@
+use actix_web::dev::Service;
 mod structures;
 
+use actix_cors::Cors;
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 
 use crate::structures::structs_git::{Asset, Release};
@@ -16,10 +18,10 @@ use std::process::{Command, Stdio};
 use std::{env, thread};
 use tokio::fs;
 
+use actix_web::http::header;
 use reqwest::{Client, blocking as blocking_reqwest};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
 use tokio::runtime::Runtime;
 use url::Url;
 
@@ -309,9 +311,24 @@ async fn download_sound_a(raw_input: &str) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_console().await;
 
-    let server = HttpServer::new(|| App::new().service(download))
-        .bind(("127.0.0.1", 8080))?
-        .run();
+    let server = HttpServer::new(|| {
+        // Настройте origin под ваш фронтенд (или .send_wildcard() для разработки)
+        let cors = Cors::default()
+            .allowed_methods(vec!["GET", "POST", "DELETE", "PUT"])
+            .allowed_headers(vec![
+                http::header::AUTHORIZATION,
+                http::header::ACCEPT,
+                http::header::CONTENT_TYPE,
+            ])
+            .max_age(3600);
+
+        App::new()
+            .wrap(cors)
+            .wrap(Cors::permissive())
+            .service(download)
+    })
+    .bind(("127.0.0.1", 8080))? // привязка
+    .run();
 
     let handle = server.handle();
     let server_task = tokio::spawn(async move {
