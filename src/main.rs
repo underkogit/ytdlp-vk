@@ -1,5 +1,7 @@
 mod structures;
 
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
+
 use crate::structures::structs_git::{Asset, Release};
 use futures_util::{StreamExt, TryFutureExt};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HOST, REFERER, USER_AGENT};
@@ -23,6 +25,7 @@ use url::Url;
 
 use anyhow::Result;
 use reqwest::blocking::get;
+use tokio::sync::oneshot;
 use zip::ZipArchive;
 
 fn extract_output_path(arg_line: &str) -> Option<PathBuf> {
@@ -79,7 +82,7 @@ async fn download_curl() -> Result<(), Box<dyn std::error::Error>> {
     Err(format!("{} not found in archive", target).into())
 }
 
-async fn download_ytdlp(
+async fn download_ytdlp_async(
     app_name: &str,
     github_api: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -212,7 +215,7 @@ async fn concurrent_download_async(url_img: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn download_sound(first: &str, second: &str) {
+async fn download_sound_async(first: &str, second: &str) {
     let first_segment = first.trim_start();
     let second_segment = second.trim_start();
 
@@ -225,10 +228,9 @@ async fn download_sound(first: &str, second: &str) {
         } else {
             if let Some(path) = extract_output_path(ytdlp) {
                 if let Some(mut path_str) = path.to_str().map(|s| s.to_string()) {
-                    let path_str = path_str.replace(".mp3", ".jpeg"); // или лучше заменить расширение через Path
+                    let path_str = path_str.replace(".mp3", ".jpeg");
                     let home: PathBuf = dirs::home_dir().unwrap();
 
-                    // если path_str — абсолютный или относительный путь относительно домашней папки:
                     let file_path = Path::new(&path_str);
                     let full_path = if file_path.is_absolute() {
                         file_path.to_path_buf()
@@ -248,14 +250,23 @@ async fn download_sound(first: &str, second: &str) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[post("/download")]
+async fn download(body: String) -> impl Responder {
+    println!("HTTP received: {}", body);
 
-    println!("{}" , "By UnderKo");
-    println!("{}" , "https://github.com/underkogit/ytdlp-vk");
-    println!("{}" , "Using: ytdlp and curl");
+    download_sound_a(body.as_str()).await;
 
-    if let Err(e) = download_ytdlp(
+    HttpResponse::Ok()
+        .content_type("text/plain; charset=utf-8")
+        .body(format!("Received {} bytes", body.len()))
+}
+
+async fn init_console() {
+    println!("{}", "By UnderKo");
+    println!("{}", "https://github.com/underkogit/ytdlp-vk");
+    println!("{}", "Using: ytdlp and curl");
+
+    if let Err(e) = download_ytdlp_async(
         "yt-dlp.exe",
         "https://api.github.com/repos/yt-dlp/yt-dlp/releases",
     )
@@ -263,10 +274,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         eprintln!("Downloading failed: {}", e);
     }
+}
 
-    // if let Err(e) = download_curl().await {
-    //     eprintln!("Downloading failed: {}", e);
-    // }
+async fn download_sound_a(raw_input: &str) {
+    let segments: Vec<String> = raw_input
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if segments.len() != 2 {
+        eprintln!(
+            "Error: the string must contain exactly one ';' (example: image:\"url\"; yt-dlp ...)."
+        );
+        return;
+    }
+
+    let first_segment: &str = segments.get(0).map(|s| s.as_str()).unwrap_or("");
+    let second_segment: &str = segments.get(1).map(|s| s.as_str()).unwrap_or("");
+
+    if first_segment.starts_with("image") && second_segment.starts_with("yt-dlp") {
+        println!("\"image\": {}", first_segment);
+        println!("\"yt-dlp\": {}", second_segment);
+        download_sound_async(first_segment, second_segment).await;
+    } else {
+        println!(
+            "The first argument or the second argument does not match the expected format:\n  first = {}\n  second = {}",
+            first_segment, second_segment
+        );
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_console().await;
+
+    let server = HttpServer::new(|| App::new().service(download))
+        .bind(("127.0.0.1", 8080))?
+        .run();
+
+    let handle = server.handle();
+    let server_task = tokio::spawn(async move {
+        let _ = server.await;
+    });
 
     loop {
         let mut raw_input = String::new();
@@ -275,6 +325,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdin().read_line(&mut raw_input)?;
         let raw_input = raw_input.trim_end();
 
+        download_sound_a(raw_input).await;
+
         if raw_input.starts_with(":help") || raw_input.starts_with(":?") {
             println!(
                 "image:\"url\"; yt-dlp -x --audio-format mp3 --embed-thumbnail --add-metadata -o \"PATH/Artist - Title.mp3\" \"URL\""
@@ -282,32 +334,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let segments: Vec<String> = raw_input
-            .split(';')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if segments.len() != 2 {
-            eprintln!(
-                "Error: the string must contain exactly one ';' (example: image:\"url\"; yt-dlp ...)."
-            );
-            continue;
-        }
-
-        let first_segment: &str = segments.get(0).map(|s| s.as_str()).unwrap_or("");
-        let second_segment: &str = segments.get(1).map(|s| s.as_str()).unwrap_or("");
-
-        if first_segment.starts_with("image") && second_segment.starts_with("yt-dlp") {
-            println!("\"image\": {}", first_segment);
-            println!("\"yt-dlp\": {}", second_segment);
-            download_sound(first_segment, second_segment).await;
-        } else {
-            println!(
-                "The first argument or the second argument does not match the expected format:\n  first = {}\n  second = {}",
-                first_segment, second_segment
-            );
-            continue;
+        if raw_input.eq_ignore_ascii_case("quit") || raw_input.eq_ignore_ascii_case("exit") {
+            let _ = handle.stop(true).await;
+            let _ = server_task.await;
+            break;
         }
     }
+
+    Ok(())
 }
