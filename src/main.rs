@@ -1,5 +1,6 @@
 use actix_web::dev::Service;
 mod structures;
+mod zip_extractor;
 
 use actix_cors::Cors;
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
@@ -9,7 +10,7 @@ use futures_util::{StreamExt, TryFutureExt};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HOST, REFERER, USER_AGENT};
 use std::error::Error;
 
-use std::io::{self, BufRead, Cursor, Write};
+use std::io::{self, BufRead, Cursor, Read, Write};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
@@ -25,6 +26,7 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use url::Url;
 
+use crate::zip_extractor::extract_prefix_from_zip;
 use anyhow::Result;
 use reqwest::blocking::get;
 use tokio::sync::oneshot;
@@ -83,7 +85,11 @@ async fn download_curl() -> Result<(), Box<dyn std::error::Error>> {
 
     Err(format!("{} not found in archive", target).into())
 }
-
+fn join_path(folder: &str, filename: &str) -> PathBuf {
+    let mut path = PathBuf::from(folder);
+    path.push(filename);
+    path
+}
 async fn download_ytdlp_async(
     app_name: &str,
     github_api: &str,
@@ -91,7 +97,60 @@ async fn download_ytdlp_async(
     if fs::metadata(app_name).await.is_ok() {
         return Ok(());
     }
+    println!("downloading ytdlp for {}", app_name);
+    println!("{}", github_api);
+    let client = reqwest::Client::new();
+    let mut req = client
+        .get(github_api)
+        .header(USER_AGENT, "gh-download-rust/0.1")
+        .header(ACCEPT, "application/vnd.github.v3+json");
+    if let Ok(t) = std::env::var("GITHUB_TOKEN") {
+        req = req.header(AUTHORIZATION, format!("token {}", t));
+    }
+    let releases: Vec<Release> = req.send().await?.error_for_status()?.json().await?;
+    let release = releases
+        .into_iter()
+        .find(|r| !r.draft)
+        .ok_or("No release found")?;
 
+    let mut filtered: Vec<Asset> = release
+        .assets
+        .into_iter()
+        .filter(|a| a.name.to_lowercase().ends_with(&app_name.to_lowercase()))
+        .collect();
+    filtered.sort_by_key(|a| std::cmp::Reverse(a.size.unwrap_or(0)));
+
+    let asset = match filtered.into_iter().next() {
+        Some(a) => a,
+        None => return Ok(()),
+    };
+
+    let url = asset
+        .browser_download_url
+        .as_deref()
+        .ok_or("asset has no browser_download_url")?;
+
+    let resp = client.get(url).send().await?.error_for_status()?;
+    let mut stream = resp.bytes_stream();
+
+    let mut file = File::create(join_path("bin_", app_name)).await?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+async fn download_ffmpeg_async(
+    app_name: &str,
+    github_api: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if fs::metadata(app_name).await.is_ok() {
+        return Ok(());
+    }
+    println!("downloading ffmpeg for {}", app_name);
+    println!("{}", github_api);
     let client = reqwest::Client::new();
     let mut req = client
         .get(github_api)
@@ -132,6 +191,14 @@ async fn download_ytdlp_async(
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
+
+    let zip_path = Path::new("ffmpeg-master-latest-win64-lgpl-shared.zip");
+    let dest = Path::new("bin_");
+    let target_prefix = "ffmpeg-master-latest-win64-lgpl-shared/bin/";
+
+    extract_prefix_from_zip(zip_path, dest, target_prefix)
+        .map_err(|e| format!("Ошибка при распаковке: {}", e))?;
+
     Ok(())
 }
 
@@ -185,7 +252,7 @@ pub fn run_and_log(exe: &str, args: &str) -> io::Result<i32> {
     Ok(status.code().unwrap_or_default())
 }
 
-async fn concurrent_download_async(url_img: &str, path: &str) -> Result<()> {
+async fn baner_download_async(url_img: &str, path: &str) -> Result<String> {
     let url = url_img.replace("\"", "");
 
     let client = reqwest::Client::builder()
@@ -214,43 +281,227 @@ async fn concurrent_download_async(url_img: &str, path: &str) -> Result<()> {
 
     println!("{}:{}", "Saved image", path);
 
+    Ok(String::from(path))
+}
+
+fn run_ffmpeg_and_capture(stderr_out: &mut String, mut cmd: Command) -> io::Result<std::process::ExitStatus> {
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    if let Some(mut s) = child.stderr.take() {
+        s.read_to_string(stderr_out)?;
+    }
+    child.wait()
+}
+
+fn set_title_with_ffmpeg(
+    ffmpeg_path: &str,
+    input: &str,
+    output: &str,
+    title: &str,
+    banner_path: String,
+) -> io::Result<()> {
+    // Попытка 1: быстрый stream copy
+    let mut stderr = String::new();
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.arg("-y")
+        .arg("-i").arg(input)
+        .arg("-i").arg(&banner_path)
+        .arg("-map").arg("0:a?")
+        .arg("-map").arg("1:v?")
+        .arg("-metadata").arg(format!("title={}", title))
+        .arg("-metadata").arg(format!("description={}", title))
+        .arg("-disposition:v:0").arg("attached_pic")
+        .arg("-c").arg("copy")
+        .arg(output);
+    let status = run_ffmpeg_and_capture(&mut stderr, cmd)?;
+    if status.success() {
+        return Ok(());
+    }
+
+    // Если copy не сработал — повторный запуск с явным id3v2 и перекодированием в mp3
+    stderr.clear();
+    let mut cmd2 = Command::new(ffmpeg_path);
+    cmd2.arg("-y")
+        .arg("-i").arg(input)
+        .arg("-i").arg(&banner_path)
+        .arg("-map").arg("0:a?")
+        .arg("-map").arg("1:v?")
+        .arg("-metadata").arg(format!("title={}", title))
+        .arg("-metadata").arg(format!("description={}", title))
+        // Пометить картинку как attached pic
+        .arg("-disposition:v:0").arg("attached_pic")
+        // Указать id3v2 версию и явно кодировать аудио в mp3
+        .arg("-id3v2_version").arg("3")
+        .arg("-c:a").arg("libmp3lame")
+        .arg("-b:a").arg("192k")
+        // для видео/изображения — mp3 теги, поэтому копируем/встраиваем картинку как attached_pic
+        .arg(output);
+    let status2 = run_ffmpeg_and_capture(&mut stderr, cmd2)?;
+    if status2.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("ffmpeg failed (both attempts):\nFirst attempt stderr:\n{}\nSecond attempt stderr:\n{}", stderr, stderr),
+        ))
+    }
+}
+
+async fn remove_and_rename(original_path: &Path, out_path_o_str: &str) -> io::Result<()> {
+    // 1) удалить файл original_path, если он существует
+    if original_path.exists() {
+        fs::remove_file(original_path).await?;
+    }
+
+    // 2) сформировать новый путь, заменив ".mp3_t" в имени файла (только последний сегмент)
+    let out_path = Path::new(out_path_o_str);
+    let parent = out_path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = out_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid out_path_o_str filename",
+            )
+        })?;
+
+    let new_file_name = file_name.replace(".mp3_t", "");
+
+    let new_path = parent.join(new_file_name);
+
+    // 3) переименовать
+    fs::rename(out_path, &new_path).await?;
+
     Ok(())
 }
 
-async fn download_sound_async(first: &str, second: &str) {
-    let first_segment = first.trim_start();
-    let second_segment = second.trim_start();
-
-    if first_segment.starts_with("image:") && second_segment.starts_with("yt-dlp:") {
-        let image = first_segment["image:".len()..].trim_start();
-        let ytdlp = second_segment["yt-dlp:".len()..].trim_start();
-
-        if let Err(e) = run_and_log("yt-dlp.exe", ytdlp) {
-            eprintln!("failed to run yt-dlp: {}", e);
+async fn download_sound_async(first: &str, second: &str) -> Result<(), io::Error> {
+    let (image, ytdlp) = {
+        let a = first.trim_start();
+        let b = second.trim_start();
+        if a.starts_with("image:") && b.starts_with("yt-dlp:") {
+            (
+                a["image:".len()..].trim_start(),
+                b["yt-dlp:".len()..].trim_start(),
+            )
         } else {
-            if let Some(path) = extract_output_path(ytdlp) {
-                if let Some(mut path_str) = path.to_str().map(|s| s.to_string()) {
-                    let path_str = path_str.replace(".mp3", ".jpeg");
-                    let home: PathBuf = dirs::home_dir().unwrap();
-
-                    let file_path = Path::new(&path_str);
-                    let full_path = if file_path.is_absolute() {
-                        file_path.to_path_buf()
-                    } else {
-                        home.join(file_path)
-                    };
-                    let path_str = full_path.to_str().unwrap();
-
-                    concurrent_download_async(image, path_str)
-                        .await
-                        .expect("TODO: panic message");
-                }
-            }
+            eprintln!("Invalid segments for download_sound");
+            return Ok(());
         }
-    } else {
-        eprintln!("Invalid segments for download_sound");
+    };
+
+    if let Err(e) = run_and_log("bin_/yt-dlp.exe", ytdlp) {
+        eprintln!("failed to run yt-dlp: {}", e);
+        return Ok(());
     }
+    let out_path = match extract_output_path(ytdlp).and_then(|p| p.to_str().map(|s| s.to_string()))
+    {
+        Some(p) => p,
+        None => {
+            eprintln!("Could not determine output path");
+            return Ok(());
+        }
+    };
+
+    let img_path = {
+        let p = if out_path.ends_with(".mp3") {
+            out_path.trim_end_matches(".mp3").to_string() + ".jpeg"
+        } else {
+            out_path.clone() + ".jpeg"
+        };
+        let p = Path::new(&p);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dirs::home_dir()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home dir"))?
+                .join(p)
+        }
+    };
+
+    let full_path_image = baner_download_async(
+        image,
+        img_path
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid path"))?,
+    )
+    .await
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("banner download failed: {}", e),
+        )
+    })?;
+
+    let tmp = format!("{}_t.mp3", out_path);
+    let file_name = Path::new(&out_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid filename"))?;
+
+    set_title_with_ffmpeg(
+        r"bin_\ffmpeg.exe",
+        &out_path,
+        &tmp,
+        file_name,
+        full_path_image,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ffmpeg failed: {}", e)))?;
+
+    let _ = remove_and_rename(out_path.as_ref(), tmp.as_ref()).await;
+    Ok(())
 }
+// async fn download_sound_async(first: &str, second: &str) {
+//     let first_segment = first.trim_start();
+//     let second_segment = second.trim_start();
+//
+//     if first_segment.starts_with("image:") && second_segment.starts_with("yt-dlp:") {
+//         let image = first_segment["image:".len()..].trim_start();
+//         let ytdlp = second_segment["yt-dlp:".len()..].trim_start();
+//
+//         if let Err(e) = run_and_log("bin_/yt-dlp.exe", ytdlp) {
+//             eprintln!("failed to run yt-dlp: {}", e);
+//         } else {
+//             if let Some(path) = extract_output_path(ytdlp) {
+//                 if let Some(mut original_path) = path.to_str().map(|s| s.to_string()) {
+//                     let image_path = original_path.replace(".mp3", ".jpeg");
+//                     let home: PathBuf = dirs::home_dir().unwrap();
+//
+//                     let file_path = Path::new(&image_path);
+//                     let full_path = if file_path.is_absolute() {
+//                         file_path.to_path_buf()
+//                     } else {
+//                         home.join(file_path)
+//                     };
+//                     let path_str = full_path.to_str().unwrap();
+//
+//                     baner_download_async(image, path_str)
+//                         .await
+//                         .expect("TODO: panic message");
+//                     let out_path_o_str = original_path.clone() + "_t.mp3";
+//
+//                     let file_name = Path::new(&original_path) .file_name()
+//                         .and_then(|s| s.to_str())
+//                         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid out_path_o_str filename"));
+//
+//                     set_title_with_ffmpeg(
+//                         r"bin_\ffmpeg.exe",
+//                         &*original_path,
+//                         &*out_path_o_str,
+//                         file_name.expect("REASON"),
+//                     )
+//                     .expect("TODO: panic message");
+//
+//                     let _ =
+//                         remove_and_rename(original_path.as_ref(), out_path_o_str.as_ref()).await;
+//                 }
+//             }
+//         }
+//     } else {
+//         eprintln!("Invalid segments for download_sound");
+//     }
+// }
 
 #[post("/download")]
 async fn download(body: String) -> impl Responder {
@@ -267,6 +518,15 @@ async fn init_console() {
     println!("{}", "By UnderKo");
     println!("{}", "https://github.com/underkogit/ytdlp-vk");
     println!("{}", "Using: ytdlp and curl");
+
+    if let Err(e) = download_ffmpeg_async(
+        "ffmpeg-master-latest-win64-lgpl-shared.zip",
+        "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases",
+    )
+    .await
+    {
+        eprintln!("Downloading failed: {}", e);
+    }
 
     if let Err(e) = download_ytdlp_async(
         "yt-dlp.exe",
