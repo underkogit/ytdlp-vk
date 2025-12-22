@@ -2,6 +2,7 @@ use actix_cors::Cors;
 use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
 use anyhow::Result;
 use std::io::{self, Write};
+use std::path::Path;
 use tokio::task::JoinHandle;
 
 mod download_manager;
@@ -11,7 +12,8 @@ mod structures;
 mod zip_extractor;
 
 use crate::download_manager::{
-    fetch_ffmpeg_release_async, fetch_ytdlp_release_async, handle_sound_command_async,
+    check_bin_contains_ffmpeg_and_ytdlp, fetch_ffmpeg_release_async, fetch_ytdlp_release_async,
+    handle_sound_command_async,
 };
 
 #[post("/download")]
@@ -29,22 +31,24 @@ async fn init_console() {
     println!("https://github.com/underkogit/ytdlp-vk");
     println!("Using: ytdlp, ffmpeg");
 
-    if let Err(e) = fetch_ffmpeg_release_async(
-        "ffmpeg-master-latest-win64-lgpl-shared.zip",
-        "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases",
-    )
-    .await
-    {
-        eprintln!("FFmpeg download failed: {}", e);
-    }
+    if (!check_bin_contains_ffmpeg_and_ytdlp(Path::new("bin_"))) {
+        if let Err(e) = fetch_ffmpeg_release_async(
+            "ffmpeg-master-latest-win64-lgpl-shared.zip",
+            "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases",
+        )
+        .await
+        {
+            eprintln!("FFmpeg download failed: {}", e);
+        }
 
-    if let Err(e) = fetch_ytdlp_release_async(
-        "yt-dlp.exe",
-        "https://api.github.com/repos/yt-dlp/yt-dlp/releases",
-    )
-    .await
-    {
-        eprintln!("yt-dlp download failed: {}", e);
+        if let Err(e) = fetch_ytdlp_release_async(
+            "yt-dlp.exe",
+            "https://api.github.com/repos/yt-dlp/yt-dlp/releases",
+        )
+        .await
+        {
+            eprintln!("yt-dlp download failed: {}", e);
+        }
     }
 }
 

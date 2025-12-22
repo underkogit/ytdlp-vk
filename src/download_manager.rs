@@ -2,6 +2,7 @@ use crate::path_ext::{extract_output_path, join_path, remove_and_rename};
 use crate::process_manager::{embed_title_and_artwork_with_ffmpeg, spawn_and_log_io};
 use crate::structures::structs_git::{Asset, Release};
 use crate::zip_extractor::extract_prefix_from_zip;
+use anyhow::Context;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, REFERER, USER_AGENT};
 use std::error::Error;
@@ -12,6 +13,17 @@ use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use zip::ZipArchive;
+
+pub fn check_bin_contains_ffmpeg_and_ytdlp(dir: &Path) -> bool {
+    if !dir.exists() || !dir.is_dir() {
+        return false;
+    }
+
+    let ffmpeg = dir.join("ffmpeg.exe");
+    let ytdlp = dir.join("yt-dlp.exe");
+
+    ffmpeg.exists() && ffmpeg.is_file() && ytdlp.exists() && ytdlp.is_file()
+}
 
 /// Асинхронно проверяет наличие локального файла "curl.exe" и при его отсутствии:
 /// - скачивает ZIP с https://curl.se/windows/latest.cgi?p=win64-mingw.zip;
@@ -189,16 +201,19 @@ pub async fn fetch_ffmpeg_release_async(
 /// - переименовывает временный файл в итоговый.
 /// При ошибках печатает сообщения и корректно возвращает/обрабатывает ошибки ввода-вывода.
 pub async fn process_and_tag_sound_async(
-    first: &str,
-    second: &str,
+    image: &str,
+    yt_dlp: &str,
+    json_data: &str,
 ) -> anyhow::Result<(), std::io::Error> {
-    let (image, ytdlp) = {
-        let a = first.trim_start();
-        let b = second.trim_start();
+    let (image, ytdlp, json) = {
+        let a = image.trim_start();
+        let b = yt_dlp.trim_start();
+        let c = json_data.trim_start();
         if a.starts_with("image:") && b.starts_with("yt-dlp:") {
             (
                 a["image:".len()..].trim_start(),
                 b["yt-dlp:".len()..].trim_start(),
+                c["json-data:".len()..].trim_start(),
             )
         } else {
             eprintln!("Invalid segments for download_sound");
@@ -227,6 +242,22 @@ pub async fn process_and_tag_sound_async(
             out_path.clone() + ".jpeg"
         };
         let p = Path::new(&base);
+        if let Some(dir) = p.parent() {
+            let file_path = dir.join(format!("{}.json", "data"));
+
+            fs::write(&file_path, json).await.unwrap_or_else(|e| {
+                panic!(
+                    "Failed to write JSON to file '{}': {}",
+                    file_path.display(),
+                    e
+                )
+            });
+
+            println!("parent dir: {}", dir.display());
+        } else {
+            println!("No parent directory (path has no parent)");
+        }
+
         if p.is_absolute() {
             p.to_path_buf()
         } else {
@@ -319,24 +350,34 @@ pub async fn handle_sound_command_async(raw_input: &str) {
         .filter(|s| !s.is_empty())
         .collect();
 
-    if segments.len() != 2 {
+    if segments.len() != 3 {
         eprintln!(
             "Error: the string must contain exactly one ';' (example: image:\"url\"; yt-dlp ...)."
         );
         return;
     }
 
-    let first_segment = segments.remove(0);
-    let second_segment = segments.remove(0);
+    let image = segments[0];
+    let yt_dlp = segments[1];
+    let json_data = segments[2];
 
-    if first_segment.starts_with("image") && second_segment.starts_with("yt-dlp") {
-        println!("\"image\": {}", first_segment);
-        println!("\"yt-dlp\": {}", second_segment);
-        process_and_tag_sound_async(first_segment, second_segment).await;
+    if image.starts_with("image")
+        && yt_dlp.starts_with("yt-dlp")
+        && json_data.starts_with("json-data")
+    {
+        println!("\"image\": {}", image);
+        println!("\"yt-dlp\": {}", yt_dlp);
+        println!("\"json-data\": {}", json_data);
+        process_and_tag_sound_async(image, yt_dlp, json_data)
+            .await
+            .expect(&format!(
+                "Failed to process and tag sound for image='{}' yt_dlp='{}' json_data='{}'",
+                image, yt_dlp, json_data
+            ));
     } else {
         println!(
             "The first argument or the second argument does not match the expected format:\n  first = {}\n  second = {}",
-            first_segment, second_segment
+            image, yt_dlp
         );
     }
 }
