@@ -76,9 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::get_unwrap();
 
     if config.validate_path() {
-        println!("Папка существует. Продолжаем выполнение...");
+        println!("Folder exists. Continuing execution...");
     } else {
-        println!("Внимание: папка {} не существует!", config.download_path);
+        println!("Warning: folder {} does not exist!", config.download_path);
     }
 
     // Создаём и запускаем сервер
