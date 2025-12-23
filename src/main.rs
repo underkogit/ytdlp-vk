@@ -1,10 +1,14 @@
+use crate::config_manager::Config;
 use actix_cors::Cors;
 use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
 use anyhow::Result;
+use lazy_static::lazy_static;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+mod config_manager;
 mod download_manager;
 mod path_ext;
 mod process_manager;
@@ -20,7 +24,9 @@ use crate::download_manager::{
 async fn download(body: String) -> impl Responder {
     println!("HTTP received: {}", body);
 
-    handle_sound_command_async(body.as_str()).await;
+    let config = Config::get();
+
+    handle_sound_command_async(body.as_str(), &config.unwrap().download_path).await;
     HttpResponse::Ok()
         .content_type("text/plain; charset=utf-8")
         .body(format!("Received {} bytes", body.len()))
@@ -66,6 +72,14 @@ fn cors_middleware() -> Cors {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_console().await;
+    Config::init()?;
+    let config = Config::get_unwrap();
+
+    if config.validate_path() {
+        println!("Папка существует. Продолжаем выполнение...");
+    } else {
+        println!("Внимание: папка {} не существует!", config.download_path);
+    }
 
     // Создаём и запускаем сервер
     let server = HttpServer::new(|| {
@@ -90,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdin().read_line(&mut raw_input)?;
         let raw_input = raw_input.trim_end();
 
-        handle_sound_command_async(raw_input).await;
+        handle_sound_command_async(raw_input, &config.download_path).await;
 
         if raw_input.starts_with(":help") || raw_input.starts_with(":?") {
             println!(

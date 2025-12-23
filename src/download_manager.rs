@@ -343,7 +343,7 @@ pub async fn download_banner_image_async(url_img: &str, path: &str) -> anyhow::R
 /// - делит строку по ';', ожидает ровно два непустых сегмента;
 /// - если форматы сегментов верны, печатает их и вызывает process_and_tag_sound_async;
 /// - в противном случае печатает сообщение об ошибке формата.
-pub async fn handle_sound_command_async(raw_input: &str) {
+pub async fn handle_sound_command_async(raw_input: &str, download_path_base: &str) {
     let mut segments: Vec<&str> = raw_input
         .split(';')
         .map(|s| s.trim())
@@ -358,7 +358,7 @@ pub async fn handle_sound_command_async(raw_input: &str) {
     }
 
     let image = segments[0];
-    let yt_dlp = segments[1];
+    let mut yt_dlp = segments[1];
     let json_data = segments[2];
 
     if image.starts_with("image")
@@ -368,11 +368,25 @@ pub async fn handle_sound_command_async(raw_input: &str) {
         println!("\"image\": {}", image);
         println!("\"yt-dlp\": {}", yt_dlp);
         println!("\"json-data\": {}", json_data);
-        process_and_tag_sound_async(image, yt_dlp, json_data)
+
+        let fyt_dlp = if let Some(pos) = yt_dlp.rfind("-o \"") {
+            if let Some(quote_end) = yt_dlp[pos + 4..].find('"') {
+                let insert_pos = pos + 4;
+                let mut result = yt_dlp.to_string();
+                result.insert_str(insert_pos, &format!("{}/", download_path_base));
+                result
+            } else {
+                yt_dlp.to_string()
+            }
+        } else {
+            yt_dlp.to_string()
+        };
+
+        process_and_tag_sound_async(image, fyt_dlp.as_str(), json_data)
             .await
             .expect(&format!(
                 "Failed to process and tag sound for image='{}' yt_dlp='{}' json_data='{}'",
-                image, yt_dlp, json_data
+                image, fyt_dlp, json_data
             ));
     } else {
         println!(
