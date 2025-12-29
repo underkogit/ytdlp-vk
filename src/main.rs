@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+mod collect_soundall;
 mod config_manager;
 mod download_manager;
 mod path_ext;

@@ -13,6 +13,7 @@ use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use zip::ZipArchive;
+use crate::collect_soundall::collect_sb;
 
 pub fn check_bin_contains_ffmpeg_and_ytdlp(dir: &Path) -> bool {
     if !dir.exists() || !dir.is_dir() {
@@ -388,6 +389,8 @@ pub async fn handle_sound_command_async(raw_input: &str, download_path_base: &st
                 "Failed to process and tag sound for image='{}' yt_dlp='{}' json_data='{}'",
                 image, fyt_dlp, json_data
             ));
+
+        collect_sb(download_path_base);
     } else {
         println!(
             "The first argument or the second argument does not match the expected format:\n  first = {}\n  second = {}",
