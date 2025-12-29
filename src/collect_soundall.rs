@@ -63,10 +63,25 @@ pub fn collect_sb(directory: &str) -> i32 {
         .collect();
 
     results.sort_by(|a, b| {
-        a.safeArtistTitle
-            .to_lowercase()
-            .cmp(&b.safeArtistTitle.to_lowercase())
+        let artist_a = a
+            .safeArtistTitle
+            .split(" - ")
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        let artist_b = b
+            .safeArtistTitle
+            .split(" - ")
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+
+        match artist_a.cmp(&artist_b) {
+            std::cmp::Ordering::Equal => a.safeArtistTitle.cmp(&b.safeArtistTitle),
+            other => other,
+        }
     });
+
     results.dedup_by(|a, b| a.safeArtistTitle == b.safeArtistTitle && a.Uri == b.Uri);
 
     let out_path = dir.join("soundall.json");
